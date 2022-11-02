@@ -4,8 +4,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import MultiStepLR
 import torch.cuda.amp as amp
 from functools import partial
-from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import argparse
@@ -27,7 +26,7 @@ class Trainer:
         self.start_epoch = 0
         self.criterion = criterion
 
-    def _save_checkpoint(self, epoch, args):
+    def _save_checkpoint(self, epoch, args):  # 保存模型
         if not os.path.exists(args.checkpoint_save_path):
             os.mkdir(args.checkpoint_save_path)
         PATH=  f"{args.checkpoint_save_path}/checkpoint_{epoch}.pt"
@@ -40,7 +39,7 @@ class Trainer:
                 }, PATH)
         print(f"Epoch {epoch} | Training checkpoint saved at {PATH}")
     
-    def _resume_checkpoint(self, ckp_path):
+    def _resume_checkpoint(self, ckp_path):  # 加载模型
         if os.path.isfile(ckp_path):
             checkpoint = torch.load(ckp_path, map_location="cuda")
             self.start_epoch = checkpoint['epoch']
@@ -53,14 +52,14 @@ class Trainer:
                 .format(ckp_path))
     def _run_batch(self, sources, targets, args):
         # forward
-        with amp.autocast(enabled=args.enable_amp):
+        with amp.autocast(enabled=args.enable_amp):  # 允许脚本区域以混合精度运行, 应该只包装网络的前向传递，包括损失计算
             outputs = self.model(sources)
             loss, num_correct = self.criterion(outputs, targets)
         
 
         # backward
-        self.optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
+        self.optimizer.zero_grad() # Sets the gradients of all optimized torch.Tensor s to zero.
+        self.scaler.scale(loss).backward() # 反向传播
         if args.max_norm:
             self.scaler.unscale_(self.optimizer)  # gradients must be unscaled before clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(). args.max_norm)
@@ -83,14 +82,15 @@ class Trainer:
             train_total += len(targets)
             train_loss += loss
         acc = train_correct_num / train_total
-        loss = train_loss/np.ceil(train_total/args.batch_size)
-        self.scheduler.step()
-        torch.cuda.empty_cache()
+        loss = train_loss / len(self.train_data)
+
+        self.scheduler.step()  # 调整学习率
+        torch.cuda.empty_cache()  # 释放所有没有占用的缓存memory
         print(f"Epoch: {epoch}, Training Loss: {loss}, Traing Acc: {acc}, Learning rate: {self.scheduler.get_last_lr()}")
     
     @torch.no_grad()
-    def _valuate_model(self, epoch, args):
-        self.model.eval()
+    def _valuate_model(self, epoch, args): # 验证模型
+        self.model.eval() # 将模型调整为预测模式
         train_correct_num = 0
         train_total = 0
         train_loss = 0
@@ -104,7 +104,7 @@ class Trainer:
             train_total += len(targets)
             train_loss += loss
         acc = train_correct_num / train_total
-        loss = train_loss/np.ceil(train_total/args.batch_size)
+        loss = train_loss  /  len(self.valid_data)
         print(f"Epoch: {epoch}, Validation Loss: {loss}, Validation Acc: {acc}")
 
     def train(self, args):
@@ -131,7 +131,7 @@ def main_worker(gpu,  args):
     if args.sync_bn:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     
-    model = DDP(model.to(gpu), device_ids=[gpu], find_unused_parameters=True)
+    model = DDP(model.to(gpu), device_ids=[gpu], find_unused_parameters=True) 
 
     # build optimizer and lr scheduler
     optimizer = torch.optim.AdamW(params=param_list, lr=args.base_lr, weight_decay=args.weight_decay)
@@ -152,6 +152,7 @@ def main_worker(gpu,  args):
                       seed=args.manual_seed)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_data, shuffle=True)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_data, shuffle=False)
+
     train_loader = torch.utils.data.DataLoader(train_data, 
                                                 batch_size=args.batch_size, 
                                                 shuffle=False, 
@@ -160,20 +161,22 @@ def main_worker(gpu,  args):
                                                 worker_init_fn=init_fn,
                                                 # collate_fn=collate_fn,   # map-type dataset
                                                 sampler=train_sampler, 
-                                                drop_last=True)
+                                                drop_last=True)  # 训练集加载器
+
     val_loader = torch.utils.data.DataLoader(val_data, 
                                             batch_size=args.batch_size_val, 
                                             shuffle=False, 
                                             num_workers=args.workers_val, 
                                             pin_memory=True, 
                                             sampler=val_sampler, 
-                                            drop_last=False)
-    criterion = build_criterion
-    manager = Trainer(model, criterion, train_loader, val_loader, gpu, optimizer, scheduler)
-    manager.train(args)
-    dist.destroy_process_group()
+                                            drop_last=False)  # 验证集加载器
+    criterion = build_criterion # 构建评价器
+    trainer = Trainer(model, criterion, train_loader, val_loader, gpu, optimizer, scheduler) # 实例化训练器
+    trainer.train(args) # 启动训练
+    dist.destroy_process_group()  # 释放资源
 
 def main():
+    # 参数生成器
     parser = argparse.ArgumentParser(description="simple distributed training job")
     parser.add_argument('--model_name', type=str, default='res', help="vgg or resnet")
     parser.add_argument('--feature', type=int, default=18, help="layer feature of the model, vgg includes 11,13,16,19, res includes 18,34,50,101,152")
@@ -208,7 +211,7 @@ def main():
     args = parser.parse_args()
 
 
-    mp.spawn(main_worker, nprocs=args.num_devices, args=(args,))
+    mp.spawn(main_worker, nprocs=args.num_devices, args=(args,)) # 启动线程
 
 if __name__=="__main__":
     main()
